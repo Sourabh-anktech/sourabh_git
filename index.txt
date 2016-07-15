@@ -1,2 +1,0 @@
-This is a git repository first file.
-I have added content third time in it
