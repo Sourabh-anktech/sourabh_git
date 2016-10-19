@@ -1,0 +1,3096 @@
+diff --git a/CHANGELOG.txt b/CHANGELOG.txt
+index 4853101..1cfc6da 100644
+--- a/CHANGELOG.txt
++++ b/CHANGELOG.txt
+@@ -1,4 +1,25 @@
+ 
++Drupal 7.51, 2016-10-05
++-----------------------
++- The Update module now also checks for updates to a disabled theme that is
++  used as an admin theme.
++- Exceptions thrown in dblog_watchdog() are now caught and ignored.
++- Clarified the warning that appears when modules are missing or have moved.
++- Log messages are now XSS filtered on display.
++- Draggable tables now work on touch screen devices.
++- Added a setting for allowing double underscores in CSS identifiers
++  (https://www.drupal.org/node/2810369).
++- If a user navigates away from a page while an Ajax request is running they
++  will no longer get an error message saying "An Ajax HTTP request terminated
++  abnormally".
++- The system_region_list() API function now takes an optional third parameter
++  which allows region name translations to be skipped when they are not needed
++  (API addition: https://www.drupal.org/node/2810365).
++- Numerous performance improvements.
++- Numerous bug fixes.
++- Numerous API documentation improvements.
++- Additional automated test coverage.
++
+ Drupal 7.50, 2016-07-07 
+ -----------------------
+ - Added a new "administer fields" permission for trusted users, which is
+diff --git a/MAINTAINERS.txt b/MAINTAINERS.txt
+index b076fd7..5603a43 100644
+--- a/MAINTAINERS.txt
++++ b/MAINTAINERS.txt
+@@ -145,7 +145,6 @@ User experience and usability
+ Node Access
+ - Moshe Weitzman 'moshe weitzman' https://www.drupal.org/u/moshe-weitzman
+ - Ken Rickard 'agentrickard' https://www.drupal.org/u/agentrickard
+-- Jess Myrbo 'xjm' https://www.drupal.org/u/xjm
+ 
+ 
+ Security team
+@@ -268,7 +267,6 @@ System module
+ - ?
+ 
+ Taxonomy module
+-- Jess Myrbo 'xjm' https://www.drupal.org/u/xjm
+ - Nathaniel Catchpole 'catch' https://www.drupal.org/u/catch
+ - Benjamin Doherty 'bangpound' https://www.drupal.org/u/bangpound
+ 
+diff --git a/includes/bootstrap.inc b/includes/bootstrap.inc
+index e42f542..3c41c69 100644
+--- a/includes/bootstrap.inc
++++ b/includes/bootstrap.inc
+@@ -8,7 +8,7 @@
+ /**
+  * The current system version.
+  */
+-define('VERSION', '7.50');
++define('VERSION', '7.51');
+ 
+ /**
+  * Core API compatibility.
+@@ -1072,8 +1072,8 @@ function _drupal_get_filename_perform_file_scan($type, $name) {
+  */
+ function _drupal_get_filename_fallback_trigger_error($type, $name, $error_type) {
+   // Hide messages due to known bugs that will appear on a lot of sites.
+-  // @todo Remove this in https://www.drupal.org/node/2762241
+-  if (empty($name) || ($type == 'module' && $name == 'default')) {
++  // @todo Remove this in https://www.drupal.org/node/2383823
++  if (empty($name)) {
+     return;
+   }
+ 
+@@ -1085,7 +1085,7 @@ function _drupal_get_filename_fallback_trigger_error($type, $name, $error_type)
+     // triggered during low-level operations that cannot necessarily be
+     // interrupted by a watchdog() call.
+     if ($error_type == 'missing') {
+-      _drupal_trigger_error_with_delayed_logging(format_string('The following @type is missing from the file system: %name. In order to fix this, put the @type back in its original location. For more information, see <a href="@documentation">the documentation page</a>.', array('@type' => $type, '%name' => $name, '@documentation' => 'https://www.drupal.org/node/2487215')), E_USER_WARNING);
++      _drupal_trigger_error_with_delayed_logging(format_string('The following @type is missing from the file system: %name. For information about how to fix this, see <a href="@documentation">the documentation page</a>.', array('@type' => $type, '%name' => $name, '@documentation' => 'https://www.drupal.org/node/2487215')), E_USER_WARNING);
+     }
+     elseif ($error_type == 'moved') {
+       _drupal_trigger_error_with_delayed_logging(format_string('The following @type has moved within the file system: %name. In order to fix this, clear caches or put the @type back in its original location. For more information, see <a href="@documentation">the documentation page</a>.', array('@type' => $type, '%name' => $name, '@documentation' => 'https://www.drupal.org/node/2487215')), E_USER_WARNING);
+diff --git a/includes/common.inc b/includes/common.inc
+index c97704c..339a69b 100644
+--- a/includes/common.inc
++++ b/includes/common.inc
+@@ -3900,6 +3900,21 @@ function drupal_delete_file_if_stale($uri) {
+  *   The cleaned identifier.
+  */
+ function drupal_clean_css_identifier($identifier, $filter = array(' ' => '-', '_' => '-', '/' => '-', '[' => '-', ']' => '')) {
++  // Use the advanced drupal_static() pattern, since this is called very often.
++  static $drupal_static_fast;
++  if (!isset($drupal_static_fast)) {
++    $drupal_static_fast['allow_css_double_underscores'] = &drupal_static(__FUNCTION__ . ':allow_css_double_underscores');
++  }
++  $allow_css_double_underscores = &$drupal_static_fast['allow_css_double_underscores'];
++  if (!isset($allow_css_double_underscores)) {
++    $allow_css_double_underscores = variable_get('allow_css_double_underscores', FALSE);
++  }
++
++  // Preserve BEM-style double-underscores depending on custom setting.
++  if ($allow_css_double_underscores) {
++    $filter['__'] = '__';
++  }
++
+   // By default, we filter using Drupal's coding standards.
+   $identifier = strtr($identifier, $filter);
+ 
+diff --git a/includes/database/database.inc b/includes/database/database.inc
+index 21b7c22..6879f69 100644
+--- a/includes/database/database.inc
++++ b/includes/database/database.inc
+@@ -296,6 +296,20 @@ abstract class DatabaseConnection extends PDO {
+    */
+   protected $prefixReplace = array();
+ 
++  /**
++   * List of escaped database, table, and field names, keyed by unescaped names.
++   *
++   * @var array
++   */
++  protected $escapedNames = array();
++
++  /**
++   * List of escaped aliases names, keyed by unescaped aliases.
++   *
++   * @var array
++   */
++  protected $escapedAliases = array();
++
+   function __construct($dsn, $username, $password, $driver_options = array()) {
+     // Initialize and prepare the connection prefix.
+     $this->setPrefix(isset($this->connectionOptions['prefix']) ? $this->connectionOptions['prefix'] : '');
+@@ -919,11 +933,14 @@ abstract class DatabaseConnection extends PDO {
+    * For some database drivers, it may also wrap the table name in
+    * database-specific escape characters.
+    *
+-   * @return
++   * @return string
+    *   The sanitized table name string.
+    */
+   public function escapeTable($table) {
+-    return preg_replace('/[^A-Za-z0-9_.]+/', '', $table);
++    if (!isset($this->escapedNames[$table])) {
++      $this->escapedNames[$table] = preg_replace('/[^A-Za-z0-9_.]+/', '', $table);
++    }
++    return $this->escapedNames[$table];
+   }
+ 
+   /**
+@@ -933,11 +950,14 @@ abstract class DatabaseConnection extends PDO {
+    * For some database drivers, it may also wrap the field name in
+    * database-specific escape characters.
+    *
+-   * @return
++   * @return string
+    *   The sanitized field name string.
+    */
+   public function escapeField($field) {
+-    return preg_replace('/[^A-Za-z0-9_.]+/', '', $field);
++    if (!isset($this->escapedNames[$field])) {
++      $this->escapedNames[$field] = preg_replace('/[^A-Za-z0-9_.]+/', '', $field);
++    }
++    return $this->escapedNames[$field];
+   }
+ 
+   /**
+@@ -948,11 +968,14 @@ abstract class DatabaseConnection extends PDO {
+    * DatabaseConnection::escapeTable(), this doesn't allow the period (".")
+    * because that is not allowed in aliases.
+    *
+-   * @return
++   * @return string
+    *   The sanitized field name string.
+    */
+   public function escapeAlias($field) {
+-    return preg_replace('/[^A-Za-z0-9_]+/', '', $field);
++    if (!isset($this->escapedAliases[$field])) {
++      $this->escapedAliases[$field] = preg_replace('/[^A-Za-z0-9_]+/', '', $field);
++    }
++    return $this->escapedAliases[$field];
+   }
+ 
+   /**
+diff --git a/includes/database/mysql/database.inc b/includes/database/mysql/database.inc
+index 4a44e68..356e039 100644
+--- a/includes/database/mysql/database.inc
++++ b/includes/database/mysql/database.inc
+@@ -240,7 +240,7 @@ class DatabaseConnection_mysql extends DatabaseConnection {
+ 
+     // Ensure that the MySQL server supports large prefixes and utf8mb4.
+     try {
+-      $this->query("CREATE TABLE {drupal_utf8mb4_test} (id VARCHAR(255), PRIMARY KEY(id(255))) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci ROW_FORMAT=DYNAMIC");
++      $this->query("CREATE TABLE {drupal_utf8mb4_test} (id VARCHAR(255), PRIMARY KEY(id(255))) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci ROW_FORMAT=DYNAMIC ENGINE=INNODB");
+     }
+     catch (Exception $e) {
+       return FALSE;
+diff --git a/includes/file.inc b/includes/file.inc
+index b15e454..de9d17d 100644
+--- a/includes/file.inc
++++ b/includes/file.inc
+@@ -273,7 +273,9 @@ function file_default_scheme() {
+  *   The normalized URI.
+  */
+ function file_stream_wrapper_uri_normalize($uri) {
+-  $scheme = file_uri_scheme($uri);
++  // Inline file_uri_scheme() function call for performance reasons.
++  $position = strpos($uri, '://');
++  $scheme = $position ? substr($uri, 0, $position) : FALSE;
+ 
+   if ($scheme && file_stream_wrapper_valid_scheme($scheme)) {
+     $target = file_uri_target($uri);
+diff --git a/includes/locale.inc b/includes/locale.inc
+index f041659..11f1413 100644
+--- a/includes/locale.inc
++++ b/includes/locale.inc
+@@ -667,9 +667,6 @@ function locale_add_language($langcode, $name = NULL, $native = NULL, $direction
+  *   translations).
+  */
+ function _locale_import_po($file, $langcode, $mode, $group = NULL) {
+-  // Try to allocate enough time to parse and import the data.
+-  drupal_set_time_limit(240);
+-
+   // Check if we have the language already in the database.
+   if (!db_query("SELECT COUNT(language) FROM {languages} WHERE language = :language", array(':language' => $langcode))->fetchField()) {
+     drupal_set_message(t('The language selected for import is not supported.'), 'error');
+@@ -753,6 +750,12 @@ function _locale_import_read_po($op, $file, $mode = NULL, $lang = NULL, $group =
+   $lineno = 0;
+ 
+   while (!feof($fd)) {
++    // Refresh the time limit every 10 parsed rows to ensure there is always
++    // enough time to import the data for large PO files.
++    if (!($lineno % 10)) {
++      drupal_set_time_limit(30);
++    }
++
+     // A line should not be longer than 10 * 1024.
+     $line = fgets($fd, 10 * 1024);
+ 
+diff --git a/includes/theme.inc b/includes/theme.inc
+index ff54d6e..9b606e9 100644
+--- a/includes/theme.inc
++++ b/includes/theme.inc
+@@ -1248,6 +1248,7 @@ function path_to_theme() {
+ function drupal_find_theme_functions($cache, $prefixes) {
+   $implementations = array();
+   $functions = get_defined_functions();
++  $theme_functions = preg_grep('/^(' . implode(')|(', $prefixes) . ')_/', $functions['user']);
+ 
+   foreach ($cache as $hook => $info) {
+     foreach ($prefixes as $prefix) {
+@@ -1264,7 +1265,7 @@ function drupal_find_theme_functions($cache, $prefixes) {
+       // intermediary suggestion.
+       $pattern = isset($info['pattern']) ? $info['pattern'] : ($hook . '__');
+       if (!isset($info['base hook']) && !empty($pattern)) {
+-        $matches = preg_grep('/^' . $prefix . '_' . $pattern . '/', $functions['user']);
++        $matches = preg_grep('/^' . $prefix . '_' . $pattern . '/', $theme_functions);
+         if ($matches) {
+           foreach ($matches as $match) {
+             $new_hook = substr($match, strlen($prefix) + 1);
+@@ -2638,7 +2639,7 @@ function template_preprocess_page(&$variables) {
+   // Move some variables to the top level for themer convenience and template cleanliness.
+   $variables['show_messages'] = $variables['page']['#show_messages'];
+ 
+-  foreach (system_region_list($GLOBALS['theme']) as $region_key => $region_name) {
++  foreach (system_region_list($GLOBALS['theme'], REGIONS_ALL, FALSE) as $region_key) {
+     if (!isset($variables['page'][$region_key])) {
+       $variables['page'][$region_key] = array();
+     }
+diff --git a/misc/ajax.js b/misc/ajax.js
+index bb4a6e1..c944ebb 100644
+--- a/misc/ajax.js
++++ b/misc/ajax.js
+@@ -476,7 +476,7 @@ Drupal.ajax.prototype.getEffect = function (response) {
+  * Handler for the form redirection error.
+  */
+ Drupal.ajax.prototype.error = function (xmlhttprequest, uri, customMessage) {
+-  alert(Drupal.ajaxError(xmlhttprequest, uri, customMessage));
++  Drupal.displayAjaxError(Drupal.ajaxError(xmlhttprequest, uri, customMessage));
+   // Remove the progress element.
+   if (this.progress.element) {
+     $(this.progress.element).remove();
+diff --git a/misc/autocomplete.js b/misc/autocomplete.js
+index d71441b..af09071 100644
+--- a/misc/autocomplete.js
++++ b/misc/autocomplete.js
+@@ -310,7 +310,7 @@ Drupal.ACDB.prototype.search = function (searchString) {
+         }
+       },
+       error: function (xmlhttp) {
+-        alert(Drupal.ajaxError(xmlhttp, db.uri));
++        Drupal.displayAjaxError(Drupal.ajaxError(xmlhttp, db.uri));
+       }
+     });
+   }, this.delay);
+diff --git a/misc/drupal.js b/misc/drupal.js
+index 427c4a1..03eef50 100644
+--- a/misc/drupal.js
++++ b/misc/drupal.js
+@@ -414,6 +414,29 @@ Drupal.getSelection = function (element) {
+ };
+ 
+ /**
++ * Add a global variable which determines if the window is being unloaded.
++ *
++ * This is primarily used by Drupal.displayAjaxError().
++ */
++Drupal.beforeUnloadCalled = false;
++$(window).bind('beforeunload pagehide', function () {
++    Drupal.beforeUnloadCalled = true;
++});
++
++/**
++ * Displays a JavaScript error from an Ajax response when appropriate to do so.
++ */
++Drupal.displayAjaxError = function (message) {
++  // Skip displaying the message if the user deliberately aborted (for example,
++  // by reloading the page or navigating to a different page) while the Ajax
++  // request was still ongoing. See, for example, the discussion at
++  // http://stackoverflow.com/questions/699941/handle-ajax-error-when-a-user-clicks-refresh.
++  if (!Drupal.beforeUnloadCalled) {
++    alert(message);
++  }
++};
++
++/**
+  * Build an error message from an Ajax response.
+  */
+ Drupal.ajaxError = function (xmlhttp, uri, customMessage) {
+diff --git a/misc/tabledrag.js b/misc/tabledrag.js
+index 3cc2701..4e07784 100644
+--- a/misc/tabledrag.js
++++ b/misc/tabledrag.js
+@@ -106,8 +106,10 @@ Drupal.tableDrag = function (table, tableSettings) {
+ 
+   // Add mouse bindings to the document. The self variable is passed along
+   // as event handlers do not have direct access to the tableDrag object.
+-  $(document).bind('mousemove', function (event) { return self.dragRow(event, self); });
+-  $(document).bind('mouseup', function (event) { return self.dropRow(event, self); });
++  $(document).bind('mousemove pointermove', function (event) { return self.dragRow(event, self); });
++  $(document).bind('mouseup pointerup', function (event) { return self.dropRow(event, self); });
++  $(document).bind('touchmove', function (event) { return self.dragRow(event.originalEvent.touches[0], self); });
++  $(document).bind('touchend', function (event) { return self.dropRow(event.originalEvent.touches[0], self); });
+ };
+ 
+ /**
+@@ -274,7 +276,10 @@ Drupal.tableDrag.prototype.makeDraggable = function (item) {
+   });
+ 
+   // Add the mousedown action for the handle.
+-  handle.mousedown(function (event) {
++  handle.bind('mousedown touchstart pointerdown', function (event) {
++    if (event.originalEvent.type == "touchstart") {
++      event = event.originalEvent.touches[0];
++    }
+     // Create a new dragObject recording the event information.
+     self.dragObject = {};
+     self.dragObject.initMouseOffset = self.getMouseOffset(item, event);
+diff --git a/modules/aggregator/aggregator.info b/modules/aggregator/aggregator.info
+index d6794e1..5241170 100644
+--- a/modules/aggregator/aggregator.info
++++ b/modules/aggregator/aggregator.info
+@@ -7,8 +7,8 @@ files[] = aggregator.test
+ configure = admin/config/services/aggregator/settings
+ stylesheets[all][] = aggregator.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/aggregator/aggregator.processor.inc b/modules/aggregator/aggregator.processor.inc
+index 44ed549..534cca5 100644
+--- a/modules/aggregator/aggregator.processor.inc
++++ b/modules/aggregator/aggregator.processor.inc
+@@ -72,7 +72,7 @@ function aggregator_aggregator_remove($feed) {
+  */
+ function aggregator_form_aggregator_admin_form_alter(&$form, $form_state) {
+   if (in_array('aggregator', variable_get('aggregator_processors', array('aggregator')))) {
+-    $info = module_invoke('aggregator', 'aggregator_process', 'info');
++    $info = module_invoke('aggregator', 'aggregator_process_info');
+     $items = drupal_map_assoc(array(3, 5, 10, 15, 20, 25), '_aggregator_items');
+     $period = drupal_map_assoc(array(3600, 10800, 21600, 32400, 43200, 86400, 172800, 259200, 604800, 1209600, 2419200, 4838400, 9676800), 'format_interval');
+     $period[AGGREGATOR_CLEAR_NEVER] = t('Never');
+diff --git a/modules/aggregator/tests/aggregator_test.info b/modules/aggregator/tests/aggregator_test.info
+index ec339a9..f3194fe 100644
+--- a/modules/aggregator/tests/aggregator_test.info
++++ b/modules/aggregator/tests/aggregator_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/block/block.info b/modules/block/block.info
+index bf9b889..be55e09 100644
+--- a/modules/block/block.info
++++ b/modules/block/block.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = block.test
+ configure = admin/structure/block
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/block/block.module b/modules/block/block.module
+index ca41da7..73e1162 100644
+--- a/modules/block/block.module
++++ b/modules/block/block.module
+@@ -285,8 +285,7 @@ function block_page_build(&$page) {
+     // Append region description if we are rendering the regions demo page.
+     $item = menu_get_item();
+     if ($item['path'] == 'admin/structure/block/demo/' . $theme) {
+-      $visible_regions = array_keys(system_region_list($theme, REGIONS_VISIBLE));
+-      foreach ($visible_regions as $region) {
++      foreach (system_region_list($theme, REGIONS_VISIBLE, FALSE) as $region) {
+         $description = '<div class="block-region">' . $all_regions[$region] . '</div>';
+         $page[$region]['block_description'] = array(
+           '#markup' => $description,
+diff --git a/modules/block/tests/block_test.info b/modules/block/tests/block_test.info
+index 6e2039a..2bb8d03 100644
+--- a/modules/block/tests/block_test.info
++++ b/modules/block/tests/block_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/block/tests/themes/block_test_theme/block_test_theme.info b/modules/block/tests/themes/block_test_theme/block_test_theme.info
+index 06e45f1..18a70cf 100644
+--- a/modules/block/tests/themes/block_test_theme/block_test_theme.info
++++ b/modules/block/tests/themes/block_test_theme/block_test_theme.info
+@@ -13,8 +13,8 @@ regions[footer] = Footer
+ regions[highlighted] = Highlighted
+ regions[help] = Help
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/blog/blog.info b/modules/blog/blog.info
+index 3676654..e4d0744 100644
+--- a/modules/blog/blog.info
++++ b/modules/blog/blog.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ files[] = blog.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/book/book.info b/modules/book/book.info
+index 5d41347..68eb2f8 100644
+--- a/modules/book/book.info
++++ b/modules/book/book.info
+@@ -7,8 +7,8 @@ files[] = book.test
+ configure = admin/content/book/settings
+ stylesheets[all][] = book.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/color/color.info b/modules/color/color.info
+index 5f15c85..1bc59cb 100644
+--- a/modules/color/color.info
++++ b/modules/color/color.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ files[] = color.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/comment/comment.info b/modules/comment/comment.info
+index b7190f6..367d1e0 100644
+--- a/modules/comment/comment.info
++++ b/modules/comment/comment.info
+@@ -9,8 +9,8 @@ files[] = comment.test
+ configure = admin/content/comment
+ stylesheets[all][] = comment.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/contact/contact.info b/modules/contact/contact.info
+index 880197e..3dbb788 100644
+--- a/modules/contact/contact.info
++++ b/modules/contact/contact.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = contact.test
+ configure = admin/structure/contact
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/contextual/contextual.info b/modules/contextual/contextual.info
+index 2309c46..a6d3e2d 100644
+--- a/modules/contextual/contextual.info
++++ b/modules/contextual/contextual.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ files[] = contextual.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/dashboard/dashboard.info b/modules/dashboard/dashboard.info
+index f5484ee..e71792f 100644
+--- a/modules/dashboard/dashboard.info
++++ b/modules/dashboard/dashboard.info
+@@ -7,8 +7,8 @@ files[] = dashboard.test
+ dependencies[] = block
+ configure = admin/dashboard/customize
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/dblog/dblog.admin.inc b/modules/dblog/dblog.admin.inc
+index 7c1c0e2..0d5780c 100644
+--- a/modules/dblog/dblog.admin.inc
++++ b/modules/dblog/dblog.admin.inc
+@@ -294,11 +294,18 @@ function theme_dblog_message($variables) {
+     else {
+       $output = t($event->message, unserialize($event->variables));
+     }
++    // If the output is expected to be a link, strip all the tags and
++    // special characters by using filter_xss() without any allowed tags.
++    // If not, use filter_xss_admin() to allow some tags.
+     if ($variables['link'] && isset($event->wid)) {
+-      // Truncate message to 56 chars.
++      // Truncate message to 56 chars after stripping all the tags.
+       $output = truncate_utf8(filter_xss($output, array()), 56, TRUE, TRUE);
+       $output = l($output, 'admin/reports/event/' . $event->wid, array('html' => TRUE));
+     }
++    else {
++      // Prevent XSS in log detail pages.
++      $output = filter_xss_admin($output);
++    }
+   }
+   return $output;
+ }
+diff --git a/modules/dblog/dblog.info b/modules/dblog/dblog.info
+index 7056bcf..724ca72 100644
+--- a/modules/dblog/dblog.info
++++ b/modules/dblog/dblog.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ files[] = dblog.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/dblog/dblog.install b/modules/dblog/dblog.install
+index abfd9a2..c2e4119 100644
+--- a/modules/dblog/dblog.install
++++ b/modules/dblog/dblog.install
+@@ -155,5 +155,14 @@ function dblog_update_7002() {
+ }
+ 
+ /**
++ * Account for possible legacy systems where dblog was not installed.
++ */
++function dblog_update_7003() {
++  if (!db_table_exists('watchdog')) {
++    db_create_table('watchdog', drupal_get_schema_unprocessed('dblog', 'watchdog'));
++  }
++}
++
++/**
+  * @} End of "addtogroup updates-7.x-extra".
+  */
+diff --git a/modules/dblog/dblog.module b/modules/dblog/dblog.module
+index eb79faf..df305a2 100644
+--- a/modules/dblog/dblog.module
++++ b/modules/dblog/dblog.module
+@@ -147,20 +147,27 @@ function dblog_watchdog(array $log_entry) {
+   if (!function_exists('drupal_substr')) {
+     require_once DRUPAL_ROOT . '/includes/unicode.inc';
+   }
+-  Database::getConnection('default', 'default')->insert('watchdog')
+-    ->fields(array(
+-      'uid' => $log_entry['uid'],
+-      'type' => drupal_substr($log_entry['type'], 0, 64),
+-      'message' => $log_entry['message'],
+-      'variables' => serialize($log_entry['variables']),
+-      'severity' => $log_entry['severity'],
+-      'link' => drupal_substr($log_entry['link'], 0, 255),
+-      'location' => $log_entry['request_uri'],
+-      'referer' => $log_entry['referer'],
+-      'hostname' => drupal_substr($log_entry['ip'], 0, 128),
+-      'timestamp' => $log_entry['timestamp'],
+-    ))
+-    ->execute();
++  try {
++    Database::getConnection('default', 'default')->insert('watchdog')
++      ->fields(array(
++        'uid' => $log_entry['uid'],
++        'type' => drupal_substr($log_entry['type'], 0, 64),
++        'message' => $log_entry['message'],
++        'variables' => serialize($log_entry['variables']),
++        'severity' => $log_entry['severity'],
++        'link' => drupal_substr($log_entry['link'], 0, 255),
++        'location' => $log_entry['request_uri'],
++        'referer' => $log_entry['referer'],
++        'hostname' => drupal_substr($log_entry['ip'], 0, 128),
++        'timestamp' => $log_entry['timestamp'],
++      ))
++      ->execute();
++  }
++  catch (Exception $e) {
++    // Exception is ignored so that watchdog does not break pages during the
++    // installation process or is not able to create the watchdog table during
++    // installation.
++  }
+ }
+ 
+ /**
+diff --git a/modules/dblog/dblog.test b/modules/dblog/dblog.test
+index a233d97..b0a58ba 100644
+--- a/modules/dblog/dblog.test
++++ b/modules/dblog/dblog.test
+@@ -521,6 +521,33 @@ class DBLogTestCase extends DrupalWebTestCase {
+   }
+ 
+   /**
++   * Verifies that exceptions are caught in dblog_watchdog().
++   */
++  protected function testDBLogException() {
++    $log = array(
++      'type'        => 'custom',
++      'message'     => 'Log entry added to test watchdog handling of Exceptions.',
++      'variables'   => array(),
++      'severity'    => WATCHDOG_NOTICE,
++      'link'        => NULL,
++      'user'        => $this->big_user,
++      'uid'         => isset($this->big_user->uid) ? $this->big_user->uid : 0,
++      'request_uri' => request_uri(),
++      'referer'     => $_SERVER['HTTP_REFERER'],
++      'ip'          => ip_address(),
++      'timestamp'   => REQUEST_TIME,
++    );
++
++    // Remove watchdog table temporarily to simulate it missing during
++    // installation.
++    db_query("DROP TABLE {watchdog}");
++
++    // Add a watchdog entry.
++    // This should not throw an Exception, but fail silently.
++    dblog_watchdog($log);
++  }
++
++  /**
+    * Gets the database log event information from the browser page.
+    *
+    * @return array
+@@ -638,4 +665,32 @@ class DBLogTestCase extends DrupalWebTestCase {
+     // Document Object Model (DOM).
+     $this->assertLink(html_entity_decode($message_text), 0, $message);
+   }
++
++  /**
++   * Make sure HTML tags are filtered out in the log detail page.
++   */
++  public function testLogMessageSanitized() {
++    $this->drupalLogin($this->big_user);
++
++    // Make sure dangerous HTML tags are filtered out in log detail page.
++    $log = array(
++      'uid' => 0,
++      'type' => 'custom',
++      'message' => "<script>alert('foo');</script> <strong>Lorem ipsum</strong>",
++      'variables' => NULL,
++      'severity' => WATCHDOG_NOTICE,
++      'link' => 'foo/bar',
++      'request_uri' => 'http://example.com?dblog=1',
++      'referer' => 'http://example.org?dblog=2',
++      'ip' => '0.0.1.0',
++      'timestamp' => REQUEST_TIME,
++    );
++    dblog_watchdog($log);
++
++    $wid = db_query('SELECT MAX(wid) FROM {watchdog}')->fetchField();
++    $this->drupalGet('admin/reports/event/' . $wid);
++    $this->assertResponse(200);
++    $this->assertNoRaw("<script>alert('foo');</script>");
++    $this->assertRaw("alert('foo'); <strong>Lorem ipsum</strong>");
++  }
+ }
+diff --git a/modules/field/field.crud.inc b/modules/field/field.crud.inc
+index ba37708..7c0e3a1 100644
+--- a/modules/field/field.crud.inc
++++ b/modules/field/field.crud.inc
+@@ -189,7 +189,7 @@ function field_create_field($field) {
+   }
+ 
+   // Clear caches
+-  field_cache_clear(TRUE);
++  field_cache_clear();
+ 
+   // Invoke external hooks after the cache is cleared for API consistency.
+   module_invoke_all('field_create_field', $field);
+@@ -288,7 +288,7 @@ function field_update_field($field) {
+   drupal_write_record('field_config', $field, $primary_key);
+ 
+   // Clear caches
+-  field_cache_clear(TRUE);
++  field_cache_clear();
+ 
+   // Invoke external hooks after the cache is cleared for API consistency.
+   module_invoke_all('field_update_field', $field, $prior_field, $has_data);
+@@ -430,7 +430,7 @@ function field_delete_field($field_name) {
+     ->execute();
+ 
+   // Clear the cache.
+-  field_cache_clear(TRUE);
++  field_cache_clear();
+ 
+   module_invoke_all('field_delete_field', $field);
+ }
+diff --git a/modules/field/field.info b/modules/field/field.info
+index a5065b3..d318cf1 100644
+--- a/modules/field/field.info
++++ b/modules/field/field.info
+@@ -11,8 +11,8 @@ dependencies[] = field_sql_storage
+ required = TRUE
+ stylesheets[all][] = theme/field.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/field/modules/field_sql_storage/field_sql_storage.info b/modules/field/modules/field_sql_storage/field_sql_storage.info
+index cc3c33c..f5e5f96 100644
+--- a/modules/field/modules/field_sql_storage/field_sql_storage.info
++++ b/modules/field/modules/field_sql_storage/field_sql_storage.info
+@@ -7,8 +7,8 @@ dependencies[] = field
+ files[] = field_sql_storage.test
+ required = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/field/modules/list/list.info b/modules/field/modules/list/list.info
+index ba44ce1..9c40694 100644
+--- a/modules/field/modules/list/list.info
++++ b/modules/field/modules/list/list.info
+@@ -7,8 +7,8 @@ dependencies[] = field
+ dependencies[] = options
+ files[] = tests/list.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/field/modules/list/tests/list_test.info b/modules/field/modules/list/tests/list_test.info
+index 03a2ed3..58ad667 100644
+--- a/modules/field/modules/list/tests/list_test.info
++++ b/modules/field/modules/list/tests/list_test.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/field/modules/number/number.info b/modules/field/modules/number/number.info
+index 633fc8b..3da7cc8 100644
+--- a/modules/field/modules/number/number.info
++++ b/modules/field/modules/number/number.info
+@@ -6,8 +6,8 @@ core = 7.x
+ dependencies[] = field
+ files[] = number.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/field/modules/options/options.info b/modules/field/modules/options/options.info
+index c418724..289d4d3 100644
+--- a/modules/field/modules/options/options.info
++++ b/modules/field/modules/options/options.info
+@@ -6,8 +6,8 @@ core = 7.x
+ dependencies[] = field
+ files[] = options.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/field/modules/text/text.info b/modules/field/modules/text/text.info
+index 5a5effc..5bd2202 100644
+--- a/modules/field/modules/text/text.info
++++ b/modules/field/modules/text/text.info
+@@ -7,8 +7,8 @@ dependencies[] = field
+ files[] = text.test
+ required = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/field/tests/field_test.info b/modules/field/tests/field_test.info
+index 9842446..4a22cda 100644
+--- a/modules/field/tests/field_test.info
++++ b/modules/field/tests/field_test.info
+@@ -6,8 +6,8 @@ files[] = field_test.entity.inc
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/field_ui/field_ui.info b/modules/field_ui/field_ui.info
+index 575c549..91b250c 100644
+--- a/modules/field_ui/field_ui.info
++++ b/modules/field_ui/field_ui.info
+@@ -6,8 +6,8 @@ core = 7.x
+ dependencies[] = field
+ files[] = field_ui.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/file/file.info b/modules/file/file.info
+index e3a24e2..2e5b7a2 100644
+--- a/modules/file/file.info
++++ b/modules/file/file.info
+@@ -6,8 +6,8 @@ core = 7.x
+ dependencies[] = field
+ files[] = tests/file.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/file/tests/file_module_test.info b/modules/file/tests/file_module_test.info
+index 0b98969..cdb1561 100644
+--- a/modules/file/tests/file_module_test.info
++++ b/modules/file/tests/file_module_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/filter/filter.info b/modules/filter/filter.info
+index d7a645c..6b69921 100644
+--- a/modules/filter/filter.info
++++ b/modules/filter/filter.info
+@@ -7,8 +7,8 @@ files[] = filter.test
+ required = TRUE
+ configure = admin/config/content/formats
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/forum/forum.info b/modules/forum/forum.info
+index dddf716..39250e4 100644
+--- a/modules/forum/forum.info
++++ b/modules/forum/forum.info
+@@ -9,8 +9,8 @@ files[] = forum.test
+ configure = admin/structure/forum
+ stylesheets[all][] = forum.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/help/help.info b/modules/help/help.info
+index 664da0c..3b48122 100644
+--- a/modules/help/help.info
++++ b/modules/help/help.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ files[] = help.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/image/image.info b/modules/image/image.info
+index 6398af3..0b14b66 100644
+--- a/modules/image/image.info
++++ b/modules/image/image.info
+@@ -7,8 +7,8 @@ dependencies[] = file
+ files[] = image.test
+ configure = admin/config/media/image-styles
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/image/tests/image_module_test.info b/modules/image/tests/image_module_test.info
+index de8eb45..d2131dd 100644
+--- a/modules/image/tests/image_module_test.info
++++ b/modules/image/tests/image_module_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = image_module_test.module
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/locale/locale.admin.inc b/modules/locale/locale.admin.inc
+index e813962..acf6eb2 100644
+--- a/modules/locale/locale.admin.inc
++++ b/modules/locale/locale.admin.inc
+@@ -1194,7 +1194,7 @@ function locale_translate_edit_form_submit($form, &$form_state) {
+     $translation = db_query("SELECT translation FROM {locales_target} WHERE lid = :lid AND language = :language", array(':lid' => $lid, ':language' => $key))->fetchField();
+     if (!empty($value)) {
+       // Only update or insert if we have a value to use.
+-      if (!empty($translation)) {
++      if (is_string($translation)) {
+         db_update('locales_target')
+           ->fields(array(
+             'translation' => $value,
+diff --git a/modules/locale/locale.info b/modules/locale/locale.info
+index 6e5728a..6e05794 100644
+--- a/modules/locale/locale.info
++++ b/modules/locale/locale.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = locale.test
+ configure = admin/config/regional/language
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/locale/locale.test b/modules/locale/locale.test
+index d2af767..6fcf06f 100644
+--- a/modules/locale/locale.test
++++ b/modules/locale/locale.test
+@@ -393,6 +393,16 @@ class LocaleTranslationFunctionalTest extends DrupalWebTestCase {
+     // The indicator should not be here.
+     $this->assertNoRaw($language_indicator, 'String is translated.');
+ 
++    // Verify that a translation set which has an empty target string can be
++    // updated without any database error.
++    db_update('locales_target')
++      ->fields(array('translation' => ''))
++      ->condition('language', $langcode, '=')
++      ->condition('lid', $lid, '=')
++      ->execute();
++    $this->drupalPost('admin/config/regional/translate/edit/' . $lid, $edit, t('Save translations'));
++    $this->assertText(t('The string has been saved.'), 'The string has been saved.');
++
+     // Try to edit a non-existent string and ensure we're redirected correctly.
+     // Assuming we don't have 999,999 strings already.
+     $random_lid = 999999;
+diff --git a/modules/locale/tests/locale_test.info b/modules/locale/tests/locale_test.info
+index c40fd12..5ea5dbc 100644
+--- a/modules/locale/tests/locale_test.info
++++ b/modules/locale/tests/locale_test.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/menu/menu.info b/modules/menu/menu.info
+index c857770..2c4681c 100644
+--- a/modules/menu/menu.info
++++ b/modules/menu/menu.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = menu.test
+ configure = admin/structure/menu
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/node/node.info b/modules/node/node.info
+index e667d13..63a0c4b 100644
+--- a/modules/node/node.info
++++ b/modules/node/node.info
+@@ -9,8 +9,8 @@ required = TRUE
+ configure = admin/structure/types
+ stylesheets[all][] = node.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/node/tests/node_access_test.info b/modules/node/tests/node_access_test.info
+index 834e2ed..7354c04 100644
+--- a/modules/node/tests/node_access_test.info
++++ b/modules/node/tests/node_access_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/node/tests/node_test.info b/modules/node/tests/node_test.info
+index 8c21262..afc1a9e 100644
+--- a/modules/node/tests/node_test.info
++++ b/modules/node/tests/node_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/node/tests/node_test_exception.info b/modules/node/tests/node_test_exception.info
+index a4f37eb..7d0eb60 100644
+--- a/modules/node/tests/node_test_exception.info
++++ b/modules/node/tests/node_test_exception.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/openid/openid.info b/modules/openid/openid.info
+index 84214c8..cc25d81 100644
+--- a/modules/openid/openid.info
++++ b/modules/openid/openid.info
+@@ -5,8 +5,8 @@ package = Core
+ core = 7.x
+ files[] = openid.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/openid/tests/openid_test.info b/modules/openid/tests/openid_test.info
+index bab315a..922fdcc 100644
+--- a/modules/openid/tests/openid_test.info
++++ b/modules/openid/tests/openid_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ dependencies[] = openid
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/overlay/overlay.info b/modules/overlay/overlay.info
+index f4508f0..63ca90f 100644
+--- a/modules/overlay/overlay.info
++++ b/modules/overlay/overlay.info
+@@ -4,8 +4,8 @@ package = Core
+ version = VERSION
+ core = 7.x
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/path/path.info b/modules/path/path.info
+index 60257e1..9f4503b 100644
+--- a/modules/path/path.info
++++ b/modules/path/path.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = path.test
+ configure = admin/config/search/path
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/php/php.info b/modules/php/php.info
+index a28acf4..a977a9a 100644
+--- a/modules/php/php.info
++++ b/modules/php/php.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ files[] = php.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/poll/poll.info b/modules/poll/poll.info
+index af1eb80..67158a1 100644
+--- a/modules/poll/poll.info
++++ b/modules/poll/poll.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = poll.test
+ stylesheets[all][] = poll.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/profile/profile.info b/modules/profile/profile.info
+index 4aea8e6..61f6f4d 100644
+--- a/modules/profile/profile.info
++++ b/modules/profile/profile.info
+@@ -11,8 +11,8 @@ configure = admin/config/people/profile
+ ; See user_system_info_alter().
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/rdf/rdf.info b/modules/rdf/rdf.info
+index 8543ff3..b0d4a64 100644
+--- a/modules/rdf/rdf.info
++++ b/modules/rdf/rdf.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ files[] = rdf.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/rdf/tests/rdf_test.info b/modules/rdf/tests/rdf_test.info
+index c060c4d..898fdf5 100644
+--- a/modules/rdf/tests/rdf_test.info
++++ b/modules/rdf/tests/rdf_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ hidden = TRUE
+ dependencies[] = blog
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/search/search.info b/modules/search/search.info
+index 05073cf..389d284 100644
+--- a/modules/search/search.info
++++ b/modules/search/search.info
+@@ -8,8 +8,8 @@ files[] = search.test
+ configure = admin/config/search/settings
+ stylesheets[all][] = search.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/search/tests/search_embedded_form.info b/modules/search/tests/search_embedded_form.info
+index 4fae057..b9c5c22 100644
+--- a/modules/search/tests/search_embedded_form.info
++++ b/modules/search/tests/search_embedded_form.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/search/tests/search_extra_type.info b/modules/search/tests/search_extra_type.info
+index 1a99986..b409794 100644
+--- a/modules/search/tests/search_extra_type.info
++++ b/modules/search/tests/search_extra_type.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/search/tests/search_node_tags.info b/modules/search/tests/search_node_tags.info
+index a41dc60..687269a 100644
+--- a/modules/search/tests/search_node_tags.info
++++ b/modules/search/tests/search_node_tags.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/shortcut/shortcut.info b/modules/shortcut/shortcut.info
+index e60526b..c5a7b28 100644
+--- a/modules/shortcut/shortcut.info
++++ b/modules/shortcut/shortcut.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = shortcut.test
+ configure = admin/config/user-interface/shortcut
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/simpletest.info b/modules/simpletest/simpletest.info
+index 46e734e..188d9ef 100644
+--- a/modules/simpletest/simpletest.info
++++ b/modules/simpletest/simpletest.info
+@@ -57,8 +57,8 @@ files[] = tests/upgrade/update.trigger.test
+ files[] = tests/upgrade/update.field.test
+ files[] = tests/upgrade/update.user.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/actions_loop_test.info b/modules/simpletest/tests/actions_loop_test.info
+index 4a4c258..977bbe0 100644
+--- a/modules/simpletest/tests/actions_loop_test.info
++++ b/modules/simpletest/tests/actions_loop_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/ajax_forms_test.info b/modules/simpletest/tests/ajax_forms_test.info
+index 06f71f9..824c266 100644
+--- a/modules/simpletest/tests/ajax_forms_test.info
++++ b/modules/simpletest/tests/ajax_forms_test.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/ajax_test.info b/modules/simpletest/tests/ajax_test.info
+index f26639d..8d3dae7 100644
+--- a/modules/simpletest/tests/ajax_test.info
++++ b/modules/simpletest/tests/ajax_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/batch_test.info b/modules/simpletest/tests/batch_test.info
+index 4c0c35f..07c8bd4 100644
+--- a/modules/simpletest/tests/batch_test.info
++++ b/modules/simpletest/tests/batch_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/boot_test_1.info b/modules/simpletest/tests/boot_test_1.info
+index 293d9de..474c4c4 100644
+--- a/modules/simpletest/tests/boot_test_1.info
++++ b/modules/simpletest/tests/boot_test_1.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/boot_test_2.info b/modules/simpletest/tests/boot_test_2.info
+index 8ef9009..ded72c5 100644
+--- a/modules/simpletest/tests/boot_test_2.info
++++ b/modules/simpletest/tests/boot_test_2.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/common.test b/modules/simpletest/tests/common.test
+index 92aefe4..0f991c3 100644
+--- a/modules/simpletest/tests/common.test
++++ b/modules/simpletest/tests/common.test
+@@ -947,6 +947,31 @@ class DrupalHTMLIdentifierTestCase extends DrupalUnitTestCase {
+ 
+     // Verify that invalid characters (including non-breaking space) are stripped from the identifier.
+     $this->assertIdentical(drupal_clean_css_identifier('invalid !"#$%&\'()*+,./:;<=>?@[\\]^`{|}~ identifier', array()), 'invalididentifier', 'Strip invalid characters.');
++
++    // Verify that double underscores are replaced in the identifier by default.
++    $identifier = 'css__identifier__with__double__underscores';
++    $expected = 'css--identifier--with--double--underscores';
++    $this->assertIdentical(drupal_clean_css_identifier($identifier), $expected, 'Verify double underscores are replaced with double hyphens by default.');
++
++    // Verify that double underscores are preserved in the identifier if the
++    // variable allow_css_double_underscores is set to TRUE.
++    $this->setAllowCSSDoubleUnderscores(TRUE);
++    $this->assertIdentical(drupal_clean_css_identifier($identifier), $identifier, 'Verify double underscores are preserved if the allow_css_double_underscores set to TRUE.');
++
++    // To avoid affecting other test cases, set the variable
++    // allow_css_double_underscores to FALSE which is the default value.
++    $this->setAllowCSSDoubleUnderscores(FALSE);
++  }
++
++  /**
++   * Set the variable allow_css_double_underscores and reset the cache.
++   *
++   * @param $value bool
++   *   A new value to be set to allow_css_double_underscores.
++   */
++  function setAllowCSSDoubleUnderscores($value) {
++    $GLOBALS['conf']['allow_css_double_underscores'] = $value;
++    drupal_static_reset('drupal_clean_css_identifier:allow_css_double_underscores');
+   }
+ 
+   /**
+@@ -1254,7 +1279,7 @@ class DrupalSetContentTestCase extends DrupalWebTestCase {
+   function testRegions() {
+     global $theme_key;
+ 
+-    $block_regions = array_keys(system_region_list($theme_key));
++    $block_regions = system_region_list($theme_key, REGIONS_ALL, FALSE);
+     $delimiter = $this->randomName(32);
+     $values = array();
+     // Set some random content for each region available.
+diff --git a/modules/simpletest/tests/common_test.info b/modules/simpletest/tests/common_test.info
+index e08fe5b..c324d8a 100644
+--- a/modules/simpletest/tests/common_test.info
++++ b/modules/simpletest/tests/common_test.info
+@@ -7,8 +7,8 @@ stylesheets[all][] = common_test.css
+ stylesheets[print][] = common_test.print.css
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/common_test_cron_helper.info b/modules/simpletest/tests/common_test_cron_helper.info
+index 676028e..619b87e 100644
+--- a/modules/simpletest/tests/common_test_cron_helper.info
++++ b/modules/simpletest/tests/common_test_cron_helper.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/database_test.info b/modules/simpletest/tests/database_test.info
+index d9b8eaa..34571d0 100644
+--- a/modules/simpletest/tests/database_test.info
++++ b/modules/simpletest/tests/database_test.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/drupal_autoload_test/drupal_autoload_test.info b/modules/simpletest/tests/drupal_autoload_test/drupal_autoload_test.info
+index 0e30f9e..910d27a 100644
+--- a/modules/simpletest/tests/drupal_autoload_test/drupal_autoload_test.info
++++ b/modules/simpletest/tests/drupal_autoload_test/drupal_autoload_test.info
+@@ -7,8 +7,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info b/modules/simpletest/tests/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info
+index 7dbb067..3276127 100644
+--- a/modules/simpletest/tests/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info
++++ b/modules/simpletest/tests/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info b/modules/simpletest/tests/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info
+index 51d5c03..e360383 100644
+--- a/modules/simpletest/tests/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info
++++ b/modules/simpletest/tests/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/entity_cache_test.info b/modules/simpletest/tests/entity_cache_test.info
+index ea3b11e..b7dc76b 100644
+--- a/modules/simpletest/tests/entity_cache_test.info
++++ b/modules/simpletest/tests/entity_cache_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ dependencies[] = entity_cache_test_dependency
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/entity_cache_test_dependency.info b/modules/simpletest/tests/entity_cache_test_dependency.info
+index 2c84218..b26436e 100644
+--- a/modules/simpletest/tests/entity_cache_test_dependency.info
++++ b/modules/simpletest/tests/entity_cache_test_dependency.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/entity_crud_hook_test.info b/modules/simpletest/tests/entity_crud_hook_test.info
+index 254db39..0b0f44b 100644
+--- a/modules/simpletest/tests/entity_crud_hook_test.info
++++ b/modules/simpletest/tests/entity_crud_hook_test.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/entity_query_access_test.info b/modules/simpletest/tests/entity_query_access_test.info
+index f0e1e1d..7ac6759 100644
+--- a/modules/simpletest/tests/entity_query_access_test.info
++++ b/modules/simpletest/tests/entity_query_access_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/error_test.info b/modules/simpletest/tests/error_test.info
+index 2f1288e..a771b6f 100644
+--- a/modules/simpletest/tests/error_test.info
++++ b/modules/simpletest/tests/error_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/file_test.info b/modules/simpletest/tests/file_test.info
+index d6fbca0..605af1d 100644
+--- a/modules/simpletest/tests/file_test.info
++++ b/modules/simpletest/tests/file_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = file_test.module
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/filter_test.info b/modules/simpletest/tests/filter_test.info
+index 3786b49..9e0a598 100644
+--- a/modules/simpletest/tests/filter_test.info
++++ b/modules/simpletest/tests/filter_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/form_test.info b/modules/simpletest/tests/form_test.info
+index ffd9649..75ee2ea 100644
+--- a/modules/simpletest/tests/form_test.info
++++ b/modules/simpletest/tests/form_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/image_test.info b/modules/simpletest/tests/image_test.info
+index 29dd3f4..4f29188 100644
+--- a/modules/simpletest/tests/image_test.info
++++ b/modules/simpletest/tests/image_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/menu_test.info b/modules/simpletest/tests/menu_test.info
+index 8aa7ebb..68a1386 100644
+--- a/modules/simpletest/tests/menu_test.info
++++ b/modules/simpletest/tests/menu_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/module_test.info b/modules/simpletest/tests/module_test.info
+index d238cd9..6cd6c3d 100644
+--- a/modules/simpletest/tests/module_test.info
++++ b/modules/simpletest/tests/module_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/path_test.info b/modules/simpletest/tests/path_test.info
+index ad27ea6..b2acd4f 100644
+--- a/modules/simpletest/tests/path_test.info
++++ b/modules/simpletest/tests/path_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/psr_0_test/psr_0_test.info b/modules/simpletest/tests/psr_0_test/psr_0_test.info
+index 8ce035e..b07bc7d 100644
+--- a/modules/simpletest/tests/psr_0_test/psr_0_test.info
++++ b/modules/simpletest/tests/psr_0_test/psr_0_test.info
+@@ -5,8 +5,8 @@ core = 7.x
+ hidden = TRUE
+ package = Testing
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/psr_4_test/psr_4_test.info b/modules/simpletest/tests/psr_4_test/psr_4_test.info
+index e2d97bd..b7324be 100644
+--- a/modules/simpletest/tests/psr_4_test/psr_4_test.info
++++ b/modules/simpletest/tests/psr_4_test/psr_4_test.info
+@@ -5,8 +5,8 @@ core = 7.x
+ hidden = TRUE
+ package = Testing
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/requirements1_test.info b/modules/simpletest/tests/requirements1_test.info
+index 8e26efe..b6f775a 100644
+--- a/modules/simpletest/tests/requirements1_test.info
++++ b/modules/simpletest/tests/requirements1_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/requirements2_test.info b/modules/simpletest/tests/requirements2_test.info
+index 3b2ac40..c4fa4da 100644
+--- a/modules/simpletest/tests/requirements2_test.info
++++ b/modules/simpletest/tests/requirements2_test.info
+@@ -7,8 +7,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/session_test.info b/modules/simpletest/tests/session_test.info
+index 7fbcf75..da76cac 100644
+--- a/modules/simpletest/tests/session_test.info
++++ b/modules/simpletest/tests/session_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/system_dependencies_test.info b/modules/simpletest/tests/system_dependencies_test.info
+index 79f902e..e5fa625 100644
+--- a/modules/simpletest/tests/system_dependencies_test.info
++++ b/modules/simpletest/tests/system_dependencies_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ hidden = TRUE
+ dependencies[] = _missing_dependency
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/system_incompatible_core_version_dependencies_test.info b/modules/simpletest/tests/system_incompatible_core_version_dependencies_test.info
+index 82dce1c..4c0fd9e 100644
+--- a/modules/simpletest/tests/system_incompatible_core_version_dependencies_test.info
++++ b/modules/simpletest/tests/system_incompatible_core_version_dependencies_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ hidden = TRUE
+ dependencies[] = system_incompatible_core_version_test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/system_incompatible_core_version_test.info b/modules/simpletest/tests/system_incompatible_core_version_test.info
+index b1affa0..01d0bda 100644
+--- a/modules/simpletest/tests/system_incompatible_core_version_test.info
++++ b/modules/simpletest/tests/system_incompatible_core_version_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 5.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/system_incompatible_module_version_dependencies_test.info b/modules/simpletest/tests/system_incompatible_module_version_dependencies_test.info
+index cffce08..d453ed1 100644
+--- a/modules/simpletest/tests/system_incompatible_module_version_dependencies_test.info
++++ b/modules/simpletest/tests/system_incompatible_module_version_dependencies_test.info
+@@ -7,8 +7,8 @@ hidden = TRUE
+ ; system_incompatible_module_version_test declares version 1.0
+ dependencies[] = system_incompatible_module_version_test (>2.0)
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/system_incompatible_module_version_test.info b/modules/simpletest/tests/system_incompatible_module_version_test.info
+index b7ce8ec..9e59bc8 100644
+--- a/modules/simpletest/tests/system_incompatible_module_version_test.info
++++ b/modules/simpletest/tests/system_incompatible_module_version_test.info
+@@ -5,8 +5,8 @@ version = 1.0
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/system_project_namespace_test.info b/modules/simpletest/tests/system_project_namespace_test.info
+index 2473e4c..3a51de4 100644
+--- a/modules/simpletest/tests/system_project_namespace_test.info
++++ b/modules/simpletest/tests/system_project_namespace_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ hidden = TRUE
+ dependencies[] = drupal:filter
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/system_test.info b/modules/simpletest/tests/system_test.info
+index 1a66fa1..7ea5e27 100644
+--- a/modules/simpletest/tests/system_test.info
++++ b/modules/simpletest/tests/system_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = system_test.module
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/taxonomy_test.info b/modules/simpletest/tests/taxonomy_test.info
+index f3ca377..d5e1235 100644
+--- a/modules/simpletest/tests/taxonomy_test.info
++++ b/modules/simpletest/tests/taxonomy_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ hidden = TRUE
+ dependencies[] = taxonomy
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/theme_test.info b/modules/simpletest/tests/theme_test.info
+index 4232da1..57fc7f4 100644
+--- a/modules/simpletest/tests/theme_test.info
++++ b/modules/simpletest/tests/theme_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/themes/test_basetheme/test_basetheme.info b/modules/simpletest/tests/themes/test_basetheme/test_basetheme.info
+index ec08d6d..e473e69 100644
+--- a/modules/simpletest/tests/themes/test_basetheme/test_basetheme.info
++++ b/modules/simpletest/tests/themes/test_basetheme/test_basetheme.info
+@@ -6,8 +6,8 @@ hidden = TRUE
+ settings[basetheme_only] = base theme value
+ settings[subtheme_override] = base theme value
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/themes/test_subtheme/test_subtheme.info b/modules/simpletest/tests/themes/test_subtheme/test_subtheme.info
+index 6c1bda5..2527b61 100644
+--- a/modules/simpletest/tests/themes/test_subtheme/test_subtheme.info
++++ b/modules/simpletest/tests/themes/test_subtheme/test_subtheme.info
+@@ -6,8 +6,8 @@ hidden = TRUE
+ 
+ settings[subtheme_override] = subtheme value
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/themes/test_theme/test_theme.info b/modules/simpletest/tests/themes/test_theme/test_theme.info
+index bbf98c2..b11f6c1 100644
+--- a/modules/simpletest/tests/themes/test_theme/test_theme.info
++++ b/modules/simpletest/tests/themes/test_theme/test_theme.info
+@@ -17,8 +17,8 @@ stylesheets[all][] = system.base.css
+ 
+ settings[theme_test_setting] = default value
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/update_script_test.info b/modules/simpletest/tests/update_script_test.info
+index 7452483..f0ada88 100644
+--- a/modules/simpletest/tests/update_script_test.info
++++ b/modules/simpletest/tests/update_script_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/update_script_test.install b/modules/simpletest/tests/update_script_test.install
+index 6955ef1..4024fb4 100644
+--- a/modules/simpletest/tests/update_script_test.install
++++ b/modules/simpletest/tests/update_script_test.install
+@@ -31,6 +31,19 @@ function update_script_test_requirements($phase) {
+           'severity' => REQUIREMENT_ERROR,
+         );
+         break;
++      case REQUIREMENT_INFO:
++        $requirements['update_script_test_stop'] = array(
++          'title' => 'Update script test stop',
++          'value' => 'Error',
++          'description' => 'This is a requirements error provided by the update_script_test module to stop the page redirect for the info.',
++          'severity' => REQUIREMENT_ERROR,
++        );
++        $requirements['update_script_test'] = array(
++          'title' => 'Update script test',
++          'description' => 'This is a requirements info provided by the update_script_test module.',
++          'severity' => REQUIREMENT_INFO,
++        );
++        break;
+     }
+   }
+ 
+diff --git a/modules/simpletest/tests/update_test_1.info b/modules/simpletest/tests/update_test_1.info
+index 23d7e5c..79b2a83 100644
+--- a/modules/simpletest/tests/update_test_1.info
++++ b/modules/simpletest/tests/update_test_1.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/update_test_2.info b/modules/simpletest/tests/update_test_2.info
+index 23d7e5c..79b2a83 100644
+--- a/modules/simpletest/tests/update_test_2.info
++++ b/modules/simpletest/tests/update_test_2.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/update_test_3.info b/modules/simpletest/tests/update_test_3.info
+index 23d7e5c..79b2a83 100644
+--- a/modules/simpletest/tests/update_test_3.info
++++ b/modules/simpletest/tests/update_test_3.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/url_alter_test.info b/modules/simpletest/tests/url_alter_test.info
+index a786387..4a6d215 100644
+--- a/modules/simpletest/tests/url_alter_test.info
++++ b/modules/simpletest/tests/url_alter_test.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/simpletest/tests/xmlrpc_test.info b/modules/simpletest/tests/xmlrpc_test.info
+index aa40fa0..28f96bb 100644
+--- a/modules/simpletest/tests/xmlrpc_test.info
++++ b/modules/simpletest/tests/xmlrpc_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/statistics/statistics.info b/modules/statistics/statistics.info
+index cada070..bcabcf0 100644
+--- a/modules/statistics/statistics.info
++++ b/modules/statistics/statistics.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = statistics.test
+ configure = admin/config/system/statistics
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/statistics/statistics.test b/modules/statistics/statistics.test
+index 7e038d6..50accd7 100644
+--- a/modules/statistics/statistics.test
++++ b/modules/statistics/statistics.test
+@@ -35,7 +35,7 @@ class StatisticsTestCase extends DrupalWebTestCase {
+         'title' => 'test',
+         'path' => 'node/1',
+         'url' => 'http://example.com',
+-        'hostname' => '192.168.1.1',
++        'hostname' => '1.2.3.3',
+         'uid' => 0,
+         'sid' => 10,
+         'timer' => 10,
+@@ -268,7 +268,7 @@ class StatisticsBlockVisitorsTestCase extends StatisticsTestCase {
+    */
+   function testIPAddressBlocking() {
+     // IP address for testing.
+-    $test_ip_address = '192.168.1.1';
++    $test_ip_address = '1.2.3.3';
+ 
+     // Verify the IP address from accesslog appears on the top visitors page
+     // and that a 'block IP address' link is displayed.
+diff --git a/modules/syslog/syslog.info b/modules/syslog/syslog.info
+index 933dd5a..91bd74f 100644
+--- a/modules/syslog/syslog.info
++++ b/modules/syslog/syslog.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = syslog.test
+ configure = admin/config/development/logging
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/system/system.admin.inc b/modules/system/system.admin.inc
+index 8ef7d7c..cdcc78f 100644
+--- a/modules/system/system.admin.inc
++++ b/modules/system/system.admin.inc
+@@ -2597,6 +2597,8 @@ function theme_status_report($variables) {
+     if (empty($requirement['#type'])) {
+       $severity = $severities[isset($requirement['severity']) ? (int) $requirement['severity'] : REQUIREMENT_OK];
+       $severity['icon'] = '<div title="' . $severity['title'] . '"><span class="element-invisible">' . $severity['title'] . '</span></div>';
++      // The requirement's 'value' key is optional, provide a default value.
++      $requirement['value'] = isset($requirement['value']) ? $requirement['value'] : '';
+ 
+       // Output table row(s)
+       if (!empty($requirement['description'])) {
+diff --git a/modules/system/system.info b/modules/system/system.info
+index a951369..d637f1c 100644
+--- a/modules/system/system.info
++++ b/modules/system/system.info
+@@ -12,8 +12,8 @@ files[] = system.test
+ required = TRUE
+ configure = admin/config/system
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/system/system.install b/modules/system/system.install
+index fa794eb..ae55b89 100644
+--- a/modules/system/system.install
++++ b/modules/system/system.install
+@@ -3271,6 +3271,21 @@ function system_update_7080() {
+ }
+ 
+ /**
++ * Remove the Drupal 6 default install profile if it is still in the database.
++ */
++function system_update_7081() {
++  // Sites which used the default install profile in Drupal 6 and then updated
++  // to Drupal 7.44 or earlier will still have a record of this install profile
++  // in the database that needs to be deleted.
++  db_delete('system')
++    ->condition('filename', 'profiles/default/default.profile')
++    ->condition('type', 'module')
++    ->condition('status', 0)
++    ->condition('schema_version', 0)
++    ->execute();
++}
++
++/**
+  * @} End of "defgroup updates-7.x-extra".
+  * The next series of updates should start at 8000.
+  */
+diff --git a/modules/system/system.module b/modules/system/system.module
+index 8a080fa..59087c8 100644
+--- a/modules/system/system.module
++++ b/modules/system/system.module
+@@ -2705,10 +2705,17 @@ function system_find_base_themes($themes, $key, $used_keys = array()) {
+  * @param $show
+  *   Possible values: REGIONS_ALL or REGIONS_VISIBLE. Visible excludes hidden
+  *   regions.
+- * @return
+- *   An array of regions in the form $region['name'] = 'description'.
++ * @param bool $labels
++ *   (optional) Boolean to specify whether the human readable machine names
++ *   should be returned or not. Defaults to TRUE, but calling code can set
++ *   this to FALSE for better performance, if it only needs machine names.
++ *
++ * @return array
++ *   An associative array of regions in the form $region['name'] = 'description'
++ *   if $labels is set to TRUE, or $region['name'] = 'name', if $labels is set
++ *   to FALSE.
+  */
+-function system_region_list($theme_key, $show = REGIONS_ALL) {
++function system_region_list($theme_key, $show = REGIONS_ALL, $labels = TRUE) {
+   $themes = list_themes();
+   if (!isset($themes[$theme_key])) {
+     return array();
+@@ -2719,10 +2726,14 @@ function system_region_list($theme_key, $show = REGIONS_ALL) {
+   // If requested, suppress hidden regions. See block_admin_display_form().
+   foreach ($info['regions'] as $name => $label) {
+     if ($show == REGIONS_ALL || !isset($info['regions_hidden']) || !in_array($name, $info['regions_hidden'])) {
+-      $list[$name] = t($label);
++      if ($labels) {
++        $list[$name] = t($label);
++      }
++      else {
++        $list[$name] = $name;
++      }
+     }
+   }
+-
+   return $list;
+ }
+ 
+@@ -2743,12 +2754,13 @@ function system_system_info_alter(&$info, $file, $type) {
+  *
+  * @param $theme
+  *   The name of a theme.
++ *
+  * @return
+  *   A string that is the region name.
+  */
+ function system_default_region($theme) {
+-  $regions = array_keys(system_region_list($theme, REGIONS_VISIBLE));
+-  return isset($regions[0]) ? $regions[0] : '';
++  $regions = system_region_list($theme, REGIONS_VISIBLE, FALSE);
++  return $regions ? reset($regions) : '';
+ }
+ 
+ /**
+@@ -3354,7 +3366,8 @@ function system_goto_action($entity, $context) {
+  */
+ function system_block_ip_action() {
+   $ip = ip_address();
+-  db_insert('blocked_ips')
++  db_merge('blocked_ips')
++    ->key(array('ip' => $ip))
+     ->fields(array('ip' => $ip))
+     ->execute();
+   watchdog('action', 'Banned IP address %ip', array('%ip' => $ip));
+@@ -3516,8 +3529,7 @@ function system_retrieve_file($url, $destination = NULL, $managed = FALSE, $repl
+ function system_page_alter(&$page) {
+   // Find all non-empty page regions, and add a theme wrapper function that
+   // allows them to be consistently themed.
+-  $regions = system_region_list($GLOBALS['theme']);
+-  foreach (array_keys($regions) as $region) {
++  foreach (system_region_list($GLOBALS['theme'], REGIONS_ALL, FALSE) as $region) {
+     if (!empty($page[$region])) {
+       $page[$region]['#theme_wrappers'][] = 'region';
+       $page[$region]['#region'] = $region;
+diff --git a/modules/system/system.test b/modules/system/system.test
+index 0542adf..ec71093 100644
+--- a/modules/system/system.test
++++ b/modules/system/system.test
+@@ -726,7 +726,7 @@ class IPAddressBlockingTestCase extends DrupalWebTestCase {
+ 
+     // Block a valid IP address.
+     $edit = array();
+-    $edit['ip'] = '192.168.1.1';
++    $edit['ip'] = '1.2.3.3';
+     $this->drupalPost('admin/config/people/ip-blocking', $edit, t('Add'));
+     $ip = db_query("SELECT iid from {blocked_ips} WHERE ip = :ip", array(':ip' => $edit['ip']))->fetchField();
+     $this->assertTrue($ip, t('IP address found in database.'));
+@@ -734,7 +734,7 @@ class IPAddressBlockingTestCase extends DrupalWebTestCase {
+ 
+     // Try to block an IP address that's already blocked.
+     $edit = array();
+-    $edit['ip'] = '192.168.1.1';
++    $edit['ip'] = '1.2.3.3';
+     $this->drupalPost('admin/config/people/ip-blocking', $edit, t('Add'));
+     $this->assertText(t('This IP address is already blocked.'));
+ 
+@@ -770,6 +770,25 @@ class IPAddressBlockingTestCase extends DrupalWebTestCase {
+      // $this->drupalPost('admin/config/people/ip-blocking', $edit, t('Save'));
+      // $this->assertText(t('You may not block your own IP address.'));
+   }
++
++  /**
++   * Test duplicate IP addresses are not present in the 'blocked_ips' table.
++   */
++  function testDuplicateIpAddress() {
++    drupal_static_reset('ip_address');
++    $submit_ip = $_SERVER['REMOTE_ADDR'] = '192.168.1.1';
++    system_block_ip_action();
++    system_block_ip_action();
++    $ip_count = db_query("SELECT iid from {blocked_ips} WHERE ip = :ip", array(':ip' => $submit_ip))->rowCount();
++    $this->assertEqual('1', $ip_count);
++    drupal_static_reset('ip_address');
++    $submit_ip = $_SERVER['REMOTE_ADDR'] = ' ';
++    system_block_ip_action();
++    system_block_ip_action();
++    system_block_ip_action();
++    $ip_count = db_query("SELECT iid from {blocked_ips} WHERE ip = :ip", array(':ip' => $submit_ip))->rowCount();
++    $this->assertEqual('1', $ip_count);
++  }
+ }
+ 
+ class CronRunTestCase extends DrupalWebTestCase {
+@@ -2449,6 +2468,12 @@ class UpdateScriptFunctionalTest extends DrupalWebTestCase {
+     $this->assertText('This is a requirements error provided by the update_script_test module.');
+     $this->clickLink('try again');
+     $this->assertText('This is a requirements error provided by the update_script_test module.');
++
++    // Check if the optional 'value' key displays without a notice.
++    variable_set('update_script_test_requirement_type', REQUIREMENT_INFO);
++    $this->drupalGet($this->update_url, array('external' => TRUE));
++    $this->assertText('This is a requirements info provided by the update_script_test module.');
++    $this->assertNoText('Notice: Undefined index: value in theme_status_report()');
+   }
+ 
+   /**
+diff --git a/modules/system/tests/cron_queue_test.info b/modules/system/tests/cron_queue_test.info
+index 8999b5f..03b3224 100644
+--- a/modules/system/tests/cron_queue_test.info
++++ b/modules/system/tests/cron_queue_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/system/tests/system_cron_test.info b/modules/system/tests/system_cron_test.info
+index c95c4d7..4f7a2da 100644
+--- a/modules/system/tests/system_cron_test.info
++++ b/modules/system/tests/system_cron_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/taxonomy/taxonomy.info b/modules/taxonomy/taxonomy.info
+index fd9f018..9bbba16 100644
+--- a/modules/taxonomy/taxonomy.info
++++ b/modules/taxonomy/taxonomy.info
+@@ -8,8 +8,8 @@ files[] = taxonomy.module
+ files[] = taxonomy.test
+ configure = admin/structure/taxonomy
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/toolbar/toolbar.info b/modules/toolbar/toolbar.info
+index f7d725d..3ce4e98 100644
+--- a/modules/toolbar/toolbar.info
++++ b/modules/toolbar/toolbar.info
+@@ -4,8 +4,8 @@ core = 7.x
+ package = Core
+ version = VERSION
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/tracker/tracker.info b/modules/tracker/tracker.info
+index e2196d0..eca5614 100644
+--- a/modules/tracker/tracker.info
++++ b/modules/tracker/tracker.info
+@@ -6,8 +6,8 @@ version = VERSION
+ core = 7.x
+ files[] = tracker.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/translation/tests/translation_test.info b/modules/translation/tests/translation_test.info
+index ba98081..0f2de51 100644
+--- a/modules/translation/tests/translation_test.info
++++ b/modules/translation/tests/translation_test.info
+@@ -5,8 +5,8 @@ package = Testing
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/translation/translation.info b/modules/translation/translation.info
+index 53a6d0c..3f36bfc 100644
+--- a/modules/translation/translation.info
++++ b/modules/translation/translation.info
+@@ -6,8 +6,8 @@ version = VERSION
+ core = 7.x
+ files[] = translation.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/trigger/tests/trigger_test.info b/modules/trigger/tests/trigger_test.info
+index 49a3313..68ade94 100644
+--- a/modules/trigger/tests/trigger_test.info
++++ b/modules/trigger/tests/trigger_test.info
+@@ -4,8 +4,8 @@ package = Testing
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/trigger/trigger.info b/modules/trigger/trigger.info
+index fca069d..72be9cc 100644
+--- a/modules/trigger/trigger.info
++++ b/modules/trigger/trigger.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = trigger.test
+ configure = admin/structure/trigger
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/update/tests/aaa_update_test.info b/modules/update/tests/aaa_update_test.info
+index 310b747..2f14b29 100644
+--- a/modules/update/tests/aaa_update_test.info
++++ b/modules/update/tests/aaa_update_test.info
+@@ -4,8 +4,8 @@ package = Testing
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/update/tests/bbb_update_test.info b/modules/update/tests/bbb_update_test.info
+index ae8691f..900d068 100644
+--- a/modules/update/tests/bbb_update_test.info
++++ b/modules/update/tests/bbb_update_test.info
+@@ -4,8 +4,8 @@ package = Testing
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/update/tests/ccc_update_test.info b/modules/update/tests/ccc_update_test.info
+index c64b204..51dc859 100644
+--- a/modules/update/tests/ccc_update_test.info
++++ b/modules/update/tests/ccc_update_test.info
+@@ -4,8 +4,8 @@ package = Testing
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/update/tests/themes/update_test_admintheme/update_test_admintheme.info b/modules/update/tests/themes/update_test_admintheme/update_test_admintheme.info
+new file mode 100644
+index 0000000..cc3e3c5
+--- /dev/null
++++ b/modules/update/tests/themes/update_test_admintheme/update_test_admintheme.info
+@@ -0,0 +1,10 @@
++name = Update test admin theme
++description = Test theme which is used as admin theme.
++core = 7.x
++hidden = TRUE
++
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
++project = "drupal"
++datestamp = "1475694174"
++
+diff --git a/modules/update/tests/themes/update_test_basetheme/update_test_basetheme.info b/modules/update/tests/themes/update_test_basetheme/update_test_basetheme.info
+index bb765f5..e8f2bfd 100644
+--- a/modules/update/tests/themes/update_test_basetheme/update_test_basetheme.info
++++ b/modules/update/tests/themes/update_test_basetheme/update_test_basetheme.info
+@@ -3,8 +3,8 @@ description = Test theme which acts as a base theme for other test subthemes.
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/update/tests/themes/update_test_subtheme/update_test_subtheme.info b/modules/update/tests/themes/update_test_subtheme/update_test_subtheme.info
+index 326c6d1..ae70713 100644
+--- a/modules/update/tests/themes/update_test_subtheme/update_test_subtheme.info
++++ b/modules/update/tests/themes/update_test_subtheme/update_test_subtheme.info
+@@ -4,8 +4,8 @@ core = 7.x
+ base theme = update_test_basetheme
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/update/tests/update_test.info b/modules/update/tests/update_test.info
+index e5255ec..8cd643b 100644
+--- a/modules/update/tests/update_test.info
++++ b/modules/update/tests/update_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/update/tests/update_test.module b/modules/update/tests/update_test.module
+index 6fe4bdd..594f80f 100644
+--- a/modules/update/tests/update_test.module
++++ b/modules/update/tests/update_test.module
+@@ -11,6 +11,7 @@
+ function update_test_system_theme_info() {
+   $themes['update_test_basetheme'] = drupal_get_path('module', 'update_test') . '/themes/update_test_basetheme/update_test_basetheme.info';
+   $themes['update_test_subtheme'] = drupal_get_path('module', 'update_test') . '/themes/update_test_subtheme/update_test_subtheme.info';
++  $themes['update_test_admintheme'] = drupal_get_path('module', 'update_test') . '/themes/update_test_admintheme/update_test_admintheme.info';
+   return $themes;
+ }
+ 
+diff --git a/modules/update/update.compare.inc b/modules/update/update.compare.inc
+index 072a0da..e3e0de3 100644
+--- a/modules/update/update.compare.inc
++++ b/modules/update/update.compare.inc
+@@ -104,7 +104,13 @@ function update_get_projects() {
+  * @see update_get_projects()
+  */
+ function _update_process_info_list(&$projects, $list, $project_type, $status) {
++  $admin_theme = variable_get('admin_theme', 'seven');
+   foreach ($list as $file) {
++    // The admin theme is a special case. It should always be considered enabled
++    // for the purposes of update checking.
++    if ($file->name === $admin_theme) {
++      $file->status = TRUE;
++    }
+     // A disabled base theme of an enabled sub-theme still has all of its code
+     // run by the sub-theme, so we include it in our "enabled" projects list.
+     if ($status && !$file->status && !empty($file->sub_themes)) {
+diff --git a/modules/update/update.info b/modules/update/update.info
+index 3d3bcc1..d4477d8 100644
+--- a/modules/update/update.info
++++ b/modules/update/update.info
+@@ -6,8 +6,8 @@ core = 7.x
+ files[] = update.test
+ configure = admin/reports/updates/settings
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/update/update.manager.inc b/modules/update/update.manager.inc
+index 0b33a5f..c7c4e4a 100644
+--- a/modules/update/update.manager.inc
++++ b/modules/update/update.manager.inc
+@@ -59,7 +59,7 @@
+  * @see update_menu()
+  * @ingroup forms
+  */
+-function update_manager_update_form($form, $form_state = array(), $context) {
++function update_manager_update_form($form, $form_state, $context) {
+   if (!_update_manager_check_backends($form, 'update')) {
+     return $form;
+   }
+diff --git a/modules/update/update.test b/modules/update/update.test
+index 9e04cda..5ce5bb8 100644
+--- a/modules/update/update.test
++++ b/modules/update/update.test
+@@ -463,6 +463,55 @@ class UpdateTestContribCase extends UpdateTestHelper {
+   }
+ 
+   /**
++   * Tests that the admin theme is always notified about security updates.
++   */
++  function testUpdateAdminThemeSecurityUpdate() {
++    // Disable the admin theme.
++    db_update('system')
++      ->fields(array('status' => 0))
++      ->condition('type', 'theme')
++      ->condition('name', 'update_test_%', 'LIKE')
++      ->execute();
++
++    variable_set('admin_theme', 'update_test_admintheme');
++
++    // Define the initial state for core and the themes.
++    $system_info = array(
++      '#all' => array(
++        'version' => '7.0',
++      ),
++      'update_test_admintheme' => array(
++        'project' => 'update_test_admintheme',
++        'version' => '7.x-1.0',
++        'hidden' => FALSE,
++      ),
++      'update_test_basetheme' => array(
++        'project' => 'update_test_basetheme',
++        'version' => '7.x-1.1',
++        'hidden' => FALSE,
++      ),
++      'update_test_subtheme' => array(
++        'project' => 'update_test_subtheme',
++        'version' => '7.x-1.0',
++        'hidden' => FALSE,
++      ),
++    );
++    variable_set('update_test_system_info', $system_info);
++    variable_set('update_check_disabled', FALSE);
++    $xml_mapping = array(
++      // This is enough because we don't check the update status of the admin
++      // theme. We want to check that the admin theme is included in the list.
++      'drupal' => '0',
++    );
++    $this->refreshUpdateStatus($xml_mapping);
++    // The admin theme is displayed even if it's disabled.
++    $this->assertText('update_test_admintheme', "The admin theme is checked for update even if it's disabled");
++    // The other disabled themes are not displayed.
++    $this->assertNoText('update_test_basetheme', 'Disabled theme is not checked for update in the list.');
++    $this->assertNoText('update_test_subtheme', 'Disabled theme is not checked for update in the list.');
++  }
++
++  /**
+    * Tests that disabled themes are only shown when desired.
+    */
+   function testUpdateShowDisabledThemes() {
+@@ -800,4 +849,4 @@ class UpdateCoreUnitTestCase extends DrupalUnitTestCase {
+     $this->assertEqual($url, $expected, "When ? is present, '$url' should be '$expected'.");
+ 
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/modules/user/tests/user_form_test.info b/modules/user/tests/user_form_test.info
+index 0ed6275..57d8fd0 100644
+--- a/modules/user/tests/user_form_test.info
++++ b/modules/user/tests/user_form_test.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/user/user.info b/modules/user/user.info
+index ffe6c93..44d2fd2 100644
+--- a/modules/user/user.info
++++ b/modules/user/user.info
+@@ -9,8 +9,8 @@ required = TRUE
+ configure = admin/config/people
+ stylesheets[all][] = user.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/modules/user/user.module b/modules/user/user.module
+index 0ba9654..b818d79 100644
+--- a/modules/user/user.module
++++ b/modules/user/user.module
+@@ -418,8 +418,6 @@ function user_load_by_name($name) {
+  *
+  * @return
+  *   A fully-loaded $user object upon successful save or FALSE if the save failed.
+- *
+- * @todo D8: Drop $edit and fix user_save() to be consistent with others.
+  */
+ function user_save($account, $edit = array(), $category = 'account') {
+   $transaction = db_transaction();
+diff --git a/profiles/minimal/minimal.info b/profiles/minimal/minimal.info
+index e188c4f..bb30cdc 100644
+--- a/profiles/minimal/minimal.info
++++ b/profiles/minimal/minimal.info
+@@ -5,8 +5,8 @@ core = 7.x
+ dependencies[] = block
+ dependencies[] = dblog
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/profiles/standard/standard.info b/profiles/standard/standard.info
+index b5cc8c0..effe395 100644
+--- a/profiles/standard/standard.info
++++ b/profiles/standard/standard.info
+@@ -24,8 +24,8 @@ dependencies[] = field_ui
+ dependencies[] = file
+ dependencies[] = rdf
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/profiles/testing/modules/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info b/profiles/testing/modules/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info
+index cd29674..d4d1248 100644
+--- a/profiles/testing/modules/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info
++++ b/profiles/testing/modules/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info
+@@ -6,8 +6,8 @@ core = 7.x
+ hidden = TRUE
+ files[] = drupal_system_listing_compatible_test.test
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/profiles/testing/modules/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info b/profiles/testing/modules/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info
+index 1926464..7469d2f 100644
+--- a/profiles/testing/modules/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info
++++ b/profiles/testing/modules/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info
+@@ -8,8 +8,8 @@ version = VERSION
+ core = 6.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/profiles/testing/testing.info b/profiles/testing/testing.info
+index c0ba962..937c48e 100644
+--- a/profiles/testing/testing.info
++++ b/profiles/testing/testing.info
+@@ -4,8 +4,8 @@ version = VERSION
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/sites/default/default.settings.php b/sites/default/default.settings.php
+index d3e6916..b044be3 100644
+--- a/sites/default/default.settings.php
++++ b/sites/default/default.settings.php
+@@ -155,7 +155,7 @@
+  *   These settings are available as of MySQL 5.5.14, and are defaults in
+  *   MySQL 5.7.7 and up.
+  * - The PHP MySQL driver must support the utf8mb4 charset (libmysqlclient
+-     5.5.3 and up, as well as mysqlnd 5.0.9 and up).
++ *   5.5.3 and up, as well as mysqlnd 5.0.9 and up).
+  * - The MySQL server must support the utf8mb4 charset (5.5.3 and up).
+  *
+  * You can optionally set prefixes for some or all database table names
+@@ -616,3 +616,15 @@ $conf['404_fast_html'] = '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML+RDFa 1.0//EN"
+  * Remove the leading hash sign to enable.
+  */
+ # $conf['theme_debug'] = TRUE;
++
++/**
++ * CSS identifier double underscores allowance:
++ *
++ * To allow CSS identifiers to contain double underscores (.example__selector)
++ * for Drupal's BEM-style naming standards, uncomment the line below.
++ * Note that if you change this value in existing sites, existing page styles
++ * may be broken.
++ *
++ * @see drupal_clean_css_identifier()
++ */
++# $conf['allow_css_double_underscores'] = TRUE;
+diff --git a/themes/bartik/bartik.info b/themes/bartik/bartik.info
+index 7127931..b2a0a40 100644
+--- a/themes/bartik/bartik.info
++++ b/themes/bartik/bartik.info
+@@ -34,8 +34,8 @@ regions[footer] = Footer
+ settings[shortcut_module_link] = 0
+ 
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/themes/garland/garland.info b/themes/garland/garland.info
+index d7eda14..24e5675 100644
+--- a/themes/garland/garland.info
++++ b/themes/garland/garland.info
+@@ -7,8 +7,8 @@ stylesheets[all][] = style.css
+ stylesheets[print][] = print.css
+ settings[garland_width] = fluid
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/themes/seven/seven.info b/themes/seven/seven.info
+index ad93305..479d04a 100644
+--- a/themes/seven/seven.info
++++ b/themes/seven/seven.info
+@@ -13,8 +13,8 @@ regions[page_bottom] = Page bottom
+ regions[sidebar_first] = First sidebar
+ regions_hidden[] = sidebar_first
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
+diff --git a/themes/stark/stark.info b/themes/stark/stark.info
+index e94a3a4..1a47c4c 100644
+--- a/themes/stark/stark.info
++++ b/themes/stark/stark.info
+@@ -5,8 +5,8 @@ version = VERSION
+ core = 7.x
+ stylesheets[all][] = layout.css
+ 
+-; Information added by Drupal.org packaging script on 2016-07-07
+-version = "7.50"
++; Information added by Drupal.org packaging script on 2016-10-05
++version = "7.51"
+ project = "drupal"
+-datestamp = "1467918493"
++datestamp = "1475694174"
+ 
