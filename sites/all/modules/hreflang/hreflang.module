@@ -18,10 +18,13 @@ function hreflang_page_build(&$page) {
   if (empty($links->links)) {
     return;
   }
-  $default_language = language_default();
+
+  global $language ;
+  $lang_name = $language->language ;
+
   foreach ($links->links as $langcode => $link) {
     // Remove HREFLANG tags of untranslated node
-    if ( ($links->links[$default_language->language]['href'] ==  $link['href']) && $langcode != $default_language->language ){
+    if ( ($links->links[$lang_name]['href'] ==  $link['href']) && $langcode != $lang_name ){
       continue;
     }
     // Content translation module may unset the href attribute.
