@@ -1461,6 +1461,60 @@ class DateTimeFunctionalTest extends DrupalWebTestCase {
   }
 }
 
+/**
+ * Tests date format configuration.
+ */
+class DateFormatTestCase extends DrupalWebTestCase {
+  public static function getInfo() {
+    return array(
+      'name' => 'Date format',
+      'description' => 'Test date format configuration and defaults.',
+      'group' => 'System',
+    );
+  }
+
+  function setUp() {
+    parent::setUp();
+
+    // Create admin user and log in admin user.
+    $this->admin_user = $this->drupalCreateUser(array('administer site configuration'));
+    $this->drupalLogin($this->admin_user);
+  }
+
+  /**
+   * Test the default date type formats are consistent.
+   */
+  function testDefaultDateFormats() {
+    // These are the default format values from format_date().
+    $default_formats = array(
+      'short' => 'm/d/Y - H:i',
+      'medium' => 'D, m/d/Y - H:i',
+      'long' => 'l, F j, Y - H:i',
+    );
+
+    // Clear the date format variables.
+    variable_del('date_format_short');
+    variable_del('date_format_medium');
+    variable_del('date_format_long');
+
+    $this->drupalGet('admin/config/regional/date-time');
+
+    foreach ($default_formats as $format_name => $format_value) {
+      $id = 'edit-date-format-' . $format_name;
+      // Check that the configuration fields match the default format.
+      $this->assertOptionSelected(
+        $id,
+        $format_value,
+        format_string('The @type format type matches the expected format @format.',
+        array(
+          '@type' => $format_name,
+          '@format' => $format_value,
+        )
+      ));
+    }
+  }
+}
+
 class PageTitleFiltering extends DrupalWebTestCase {
   protected $content_user;
   protected $saved_title;
@@ -1888,6 +1942,30 @@ class SystemThemeFunctionalTest extends DrupalWebTestCase {
     $this->drupalGet('');
     $elements = $this->xpath('//*[@id=:id]/img', array(':id' => 'logo'));
     $this->assertEqual($elements[0]['src'], file_create_url($uploaded_filename));
+  }
+
+
+  /**
+   * Test the individual per-theme settings form.
+   */
+  function testPerThemeSettings() {
+    // Enable the test theme and the module that controls it. Clear caches in
+    // between so that the module's hook_system_theme_info() implementation is
+    // correctly registered.
+    module_enable(array('theme_test'));
+    drupal_flush_all_caches();
+    theme_enable(array('test_theme'));
+
+    // Test that the theme-specific settings form can be saved and that the
+    // theme-specific checkbox is checked and unchecked as appropriate.
+    $this->drupalGet('admin/appearance/settings/test_theme');
+    $this->assertNoFieldChecked('edit-test-theme-checkbox', 'The test_theme_checkbox setting is unchecked.');
+    $this->drupalPost(NULL, array('test_theme_checkbox' => TRUE), t('Save configuration'));
+    $this->assertText('The test theme setting was saved.');
+    $this->assertFieldChecked('edit-test-theme-checkbox', 'The test_theme_checkbox setting is checked.');
+    $this->drupalPost(NULL, array('test_theme_checkbox' => FALSE), t('Save configuration'));
+    $this->assertText('The test theme setting was saved.');
+    $this->assertNoFieldChecked('edit-test-theme-checkbox', 'The test_theme_checkbox setting is unchecked.');
   }
 
   /**
